@@ -813,7 +813,7 @@ const Agent = {
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
 
-      if (msg.type === 'pong') return;
+      if (msg.type === 'pong') { this.lastPong = Date.now(); return; }
 
       if (msg.type === 'connected') {
         console.log('[Agent] Connected v' + msg.version);
@@ -866,8 +866,15 @@ const Agent = {
 
   startHeartbeat() {
     this.stopHeartbeat();
+    this.lastPong = Date.now();
     this.hbTimer = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        // 지난 두 번의 핑(약 20초) 동안 pong이 없으면 좀비 연결로 보고 강제로 끊어 재연결한다.
+        // 느린 망·프록시가 WebSocket을 조용히 끊어도 브라우저 onclose가 안 뜨는 경우를 대비.
+        if (Date.now() - this.lastPong > 45000) {
+          try { this.ws.close(); } catch {}
+          return;
+        }
         this.send({ type: 'ping' });
       }
     }, 20000); // 20초마다 핑
@@ -900,13 +907,13 @@ const Agent = {
       const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
       this.pending.set(id, { resolve, reject });
       this.send({ type: 'navigate', id, url });
-      // 30초 타임아웃
+      // 35초 타임아웃 — 서버 데드라인(20초) + 큰 응답 전송 시간 여유.
       setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
-          reject(new Error('에이전트 응답 시간 초과 (30초)'));
+          reject(new Error('에이전트 응답 시간 초과 — 서버가 응답했지만 전송이 느리거나 연결이 불안정할 수 있습니다. 프록시 모드를 사용해 보세요.'));
         }
-      }, 30000);
+      }, 35000);
     });
   },
 

@@ -19,13 +19,17 @@ const MAX_RESOURCE_SIZE = 2 * 1024 * 1024;   // 개별 리소스 최대 2MB
 const MAX_PAGE_SIZE = 8 * 1024 * 1024;        // 전체 페이지 최대 8MB
 const FETCH_TIMEOUT = 6000;                    // 리소스 fetch 타임아웃 6초
 const PAGE_TIMEOUT = 15000;                    // HTML fetch 타임아웃 15초
-const TOTAL_DEADLINE = 25000;                  // 전체 처리 데드라인 25초
-const INLINE_BUDGET = 12000;                   // CSS/이미지 인라인 시간 예산 12초
+const TOTAL_DEADLINE = 20000;                  // 전체 처리 데드라인 20초 (클라이언트 35초보다 짧게)
+const INLINE_BUDGET = 10000;                   // CSS/이미지 인라인 시간 예산 10초
 const MIN_INLINE_BUDGET = 2000;                // 최소 인라인 예산 2초 (이하면 건너뜀)
 const HEARTBEAT_INTERVAL = 25000;              // 하트비트 간격 25초
 const MAX_INLINE_IMAGES = 15;                  // 인라인할 이미지 최대 개수
 const MAX_INLINE_CSS = 6;                      // 인라인할 CSS 최대 개수
 const MAX_CSS_URL_REFS = 10;                   // CSS 내 url() 인라인 최대 개수
+// WebSocket 1프레임으로 전송되므로 인라인 총량을 제한해야 메시지가 작게 유지된다.
+// 네이버처럼 무거운 사이트에서 이미지를 통째로 base64 인라인하면 20~40MB가 되어
+// 느린 망에서 전송이 끊기거나 30초를 넘긴다. 인라인 데이터 합계를 5MB로 제한한다.
+const MAX_INLINE_TOTAL = 5 * 1024 * 1024;
 
 // ── MIME 타입 매핑 ──
 const MIME_EXT = {
@@ -74,11 +78,17 @@ async function safeFetch(url, opts = {}) {
 }
 
 // ── 리소스를 data URI로 변환 ──
-async function toDataUri(url) {
+// budget: {used:number} 객체를 넘기면 인라인 총량을 추적하고, MAX_INLINE_TOTAL을 넘으면 중단한다.
+async function toDataUri(url, budget) {
   try {
+    if (budget && budget.used >= MAX_INLINE_TOTAL) return null;
     const res = await safeFetch(url);
     const buf = Buffer.from(await res.arrayBuffer());
     if (buf.length > MAX_RESOURCE_SIZE) return null;
+    if (budget) {
+      if (budget.used + buf.length > MAX_INLINE_TOTAL) return null;
+      budget.used += buf.length;
+    }
     const mime = guessMime(url, res.headers.get('content-type'));
     return `data:${mime};base64,${buf.toString('base64')}`;
   } catch {
@@ -99,7 +109,7 @@ function raceDeadline(promise, ms, fallback) {
 }
 
 // ── CSS 내 url() 참조를 인라인 (개수 제한) ──
-async function inlineCssUrls(css, baseUrl) {
+async function inlineCssUrls(css, baseUrl, budget) {
   const urlPattern = /url\(\s*['"]?([^'")]+)['"]?\s*\)/g;
   const matches = [...css.matchAll(urlPattern)].slice(0, MAX_CSS_URL_REFS);
   const replacements = new Map();
@@ -109,7 +119,7 @@ async function inlineCssUrls(css, baseUrl) {
     if (raw.startsWith('data:')) return;
     try {
       const abs = new URL(raw, baseUrl).href;
-      const dataUri = await toDataUri(abs);
+      const dataUri = await toDataUri(abs, budget);
       if (dataUri) replacements.set(m[0], `url("${dataUri}")`);
     } catch {}
   }));
@@ -122,7 +132,7 @@ async function inlineCssUrls(css, baseUrl) {
 }
 
 // ── 외부 CSS를 인라인 <style>로 변환 (병렬 + 개수 제한) ──
-async function inlineStylesheets(doc, baseUrl) {
+async function inlineStylesheets(doc, baseUrl, budget) {
   const links = [...doc.querySelectorAll('link[rel="stylesheet"], link[rel="preload"][as="style"]')].slice(0, MAX_INLINE_CSS);
   // 남은 CSS link는 절대 URL로 변환 (제한 초과분도 로드는 시도할 수 있게)
   doc.querySelectorAll('link[rel="stylesheet"], link[rel="preload"][as="style"]').forEach((el, i) => {
@@ -141,7 +151,7 @@ async function inlineStylesheets(doc, baseUrl) {
       const abs = new URL(href, baseUrl).href;
       const res = await safeFetch(abs, { accept: 'text/css' });
       let css = await res.text();
-      css = await inlineCssUrls(css, abs);
+      css = await inlineCssUrls(css, abs, budget);
       const style = doc.createElement('style');
       style.textContent = css;
       link.replaceWith(style);
@@ -153,14 +163,14 @@ async function inlineStylesheets(doc, baseUrl) {
 }
 
 // ── 이미지를 data URI로 인라인 ──
-async function inlineImages(doc, baseUrl) {
+async function inlineImages(doc, baseUrl, budget) {
   const imgs = [...doc.querySelectorAll('img[src]')].slice(0, MAX_INLINE_IMAGES);
   await Promise.all(imgs.map(async (img) => {
     const src = img.getAttribute('src');
     if (!src || src.startsWith('data:')) return;
     try {
       const abs = new URL(src, baseUrl).href;
-      const dataUri = await toDataUri(abs);
+      const dataUri = await toDataUri(abs, budget);
       if (dataUri) img.setAttribute('src', dataUri);
       else img.setAttribute('src', abs); // 실패해도 절대 URL로
     } catch {
@@ -294,10 +304,12 @@ async function renderPage(url) {
 
   if (inlineBudget >= MIN_INLINE_BUDGET) {
     // 시간 예산이 있으면 CSS와 이미지를 병렬로 인라인 시도
+    // budget으로 인라인 총 바이트를 추적해 메시지가 WebSocket 전송에 안전한 크기를 유지
     // raceDeadline: 예산 내에 끝나면 결과 사용, 아니면 무시하고 진행
+    const budget = { used: 0 };
     const inlineWork = Promise.all([
-      inlineStylesheets(doc, finalUrl),
-      inlineImages(doc, finalUrl),
+      inlineStylesheets(doc, finalUrl, budget),
+      inlineImages(doc, finalUrl, budget),
     ]);
     const result = await raceDeadline(inlineWork, inlineBudget, 'timeout');
     if (result === 'timeout') {
