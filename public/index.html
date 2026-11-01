@@ -828,14 +828,16 @@ const Agent = {
         return;
       }
 
+      // 'loading'은 아직 결과가 아니므로 pending에서 삭제하지 않는다.
+      if (msg.type === 'loading') return;
+
       // navigate 응답 처리
       const id = msg.id;
       if (id && this.pending.has(id)) {
         const { resolve, reject } = this.pending.get(id);
         this.pending.delete(id);
         if (msg.type === 'page') resolve(msg);
-        else if (msg.type === 'error') reject(new Error(msg.message));
-        // 'loading'은 무시 (진행 표시용)
+        else if (msg.type === 'error') reject(new Error(msg.message || '서버 처리 실패'));
       }
     };
 
@@ -843,6 +845,11 @@ const Agent = {
       this.connected = false;
       this.stopHeartbeat();
       this.updateStatus('disconnected');
+      // 아직 응답을 기다리는 요청들을 모두 거부해 무한 로딩을 막는다.
+      for (const { reject } of this.pending.values()) {
+        try { reject(new Error('에이전트 연결이 끊겼습니다. 다시 시도하세요.')); } catch {}
+      }
+      this.pending.clear();
       this.scheduleReconnect();
     };
 
@@ -922,6 +929,9 @@ const Agent = {
     if (this.reconnTimer) { clearTimeout(this.reconnTimer); this.reconnTimer = null; }
     if (this.ws) { this.ws.close(); this.ws = null; }
     this.connected = false;
+    for (const { reject } of this.pending.values()) {
+      try { reject(new Error('에이전트가 종료되었습니다.')); } catch {}
+    }
     this.pending.clear();
   }
 };
@@ -1062,12 +1072,15 @@ function renderTabs(){
 
 // 에이전트 모드로 페이지 표시 (srcdoc 또는 blob URL 사용)
 async function openViewerAgent(url, skipHist, t = S.act) {
+  if (!t) return;
+  // 영상·실시간 사이트는 agent.js가 스크립트를 제거해서 재생 불가. 사용자가 재시도 버튼을 눌러도 자동으로 Wisp로 돌린다.
+  if (wispOnly(url)) { openViewer(url, skipHist, t); return; }
   killFrame(t);
   t.curUrl = url;
   t.loadUrl = null;
   t.title = '';
   Agent.mode = 'agent';
-  Agent.updateStatus('connected');
+  renderModeChip();
 
   if (!skipHist) {
     t.hist.length = t.histIdx + 1;
@@ -1082,6 +1095,14 @@ async function openViewerAgent(url, skipHist, t = S.act) {
   }
   resetLoader(t, '에이전트가 페이지를 가져오는 중…');
   renderTabs();
+
+  // 연결이 안 된 상태면 재연결을 유도하고 안내한다. navigate가 즉시 reject하도록 되어 있지만,
+  // 명시적인 안내가 더 친절하다.
+  if (!Agent.connected) {
+    Agent.connect();
+    showAgentError(t, url, '에이전트 WebSocket에 연결되어 있지 않습니다. 다시 시도하거나 프록시 모드로 열어 보세요.');
+    return;
+  }
 
   try {
     const result = await Agent.navigate(url);

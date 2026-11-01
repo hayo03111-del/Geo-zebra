@@ -56,7 +56,9 @@ const server = app.listen(process.env.PORT || 3000, () => {
 // ── WebSocket 업그레이드 라우팅 ──
 // /wisp/  → 기존 Wisp 프록시 (YouTube, 치지직 등 스트리밍 가능)
 // /agent/ → 에이전트 모드 (서버사이드 렌더링, 백업)
-const agentWss = new WebSocketServer({ noServer: true });
+// 큰 페이지가 WebSocket 1프레임으로 들어오므로 payload 상한을 16MB로 올린다 (기본 100MB보다는 낮게).
+// perMessageDeflate는 큰 HTML을 압축해 전송 시간을 줄인다.
+const agentWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024, perMessageDeflate: { threshold: 1024 } });
 
 agentWss.on('connection', handleAgentConnection);
 

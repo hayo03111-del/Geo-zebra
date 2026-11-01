@@ -186,6 +186,8 @@ async function inlineImages(doc, baseUrl) {
 // ── 스크립트 제거 (보안 + 가벼움) ──
 function stripScripts(doc) {
   doc.querySelectorAll('script, noscript').forEach(el => el.remove());
+  // 모듈/스크립트 preload도 blob iframe에서 CORS 실패로 콘솔 에러를 뿌리므로 함께 제거
+  doc.querySelectorAll('link[rel="modulepreload"], link[rel="preload"][as="script"], link[rel="prefetch"][as="script"]').forEach(el => el.remove());
   // 인라인 이벤트 핸들러 제거
   const allEls = doc.querySelectorAll('*');
   allEls.forEach(el => {
@@ -196,19 +198,20 @@ function stripScripts(doc) {
   });
 }
 
-// ── 상대 URL을 절대 URL로 변환 (남은 href들) ──
+// ── 상대 URL을 절대 URL로 변환 (남은 href/src/action 등) ──
 function absolutifyUrls(doc, baseUrl) {
-  // <a> 태그의 href를 절대 경로로
-  doc.querySelectorAll('a[href]').forEach(a => {
-    const href = a.getAttribute('href');
-    if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('data:')) return;
-    try {
-      a.setAttribute('href', new URL(href, baseUrl).href);
-    } catch {}
+  const abs = (raw) => { try { return new URL(raw, baseUrl).href; } catch { return null; } };
+  const skip = (v) => !v || v.startsWith('#') || /^(javascript|data|blob|mailto|tel|about):/i.test(v);
+
+  // href 속성 — a, area, link (link는 modulepreload 등 이미 제거됨)
+  doc.querySelectorAll('a[href], area[href], link[href]').forEach(el => {
+    const v = el.getAttribute('href'); if (skip(v)) return;
+    const u = abs(v); if (u) el.setAttribute('href', u);
   });
-  // <form> action
-  doc.querySelectorAll('form[action]').forEach(f => {
-    try { f.setAttribute('action', new URL(f.getAttribute('action'), baseUrl).href); } catch {}
+  // src 속성 — iframe, source, video, audio, embed, track (img는 inlineImages가 data URI로 바꿈)
+  doc.querySelectorAll('iframe[src], source[src], video[src], audio[src], embed[src], track[src]').forEach(el => {
+    const v = el.getAttribute('src'); if (skip(v)) return;
+    const u = abs(v); if (u) el.setAttribute('src', u);
   });
   // <link> (favicon 등)
   doc.querySelectorAll('link[href]').forEach(link => {
@@ -224,6 +227,9 @@ function absolutifyUrls(doc, baseUrl) {
       try { img.setAttribute('src', new URL(src, baseUrl).href); } catch {}
     }
   });
+  // form action, object data
+  doc.querySelectorAll('form[action]').forEach(f => { const v=f.getAttribute('action'); if(!skip(v)){const u=abs(v); if(u)f.setAttribute('action',u);} });
+  doc.querySelectorAll('object[data]').forEach(o => { const v=o.getAttribute('data'); if(!skip(v)){const u=abs(v); if(u)o.setAttribute('data',u);} });
 }
 
 // ── 메인: URL을 인라인 HTML로 변환 (항상 성공 전략) ──
