@@ -283,57 +283,61 @@ async function renderPage(url) {
   }
 
   // ═══ 2단계: DOM 파싱 + 필수 처리 (빠름, 항상 실행) ═══
+  // jsdom window는 반드시 close()로 해제한다. 안 그러면 매 탐색마다 메모리가 누적되어
+  // Render 512MB 한계를 넘고 프로세스가 재시작되며 에이전트·프록시 연결이 동시에 끊긴다.
   const dom = new JSDOM(html, { url: finalUrl });
-  const doc = dom.window.document;
+  try {
+    const doc = dom.window.document;
 
-  stripScripts(doc);
-  absolutifyUrls(doc, finalUrl);
+    stripScripts(doc);
+    absolutifyUrls(doc, finalUrl);
 
-  // <base> 태그 추가 (남은 상대 경로 대비)
-  let base = doc.querySelector('base');
-  if (!base) {
-    base = doc.createElement('base');
-    const head = doc.querySelector('head') || doc.documentElement;
-    head.prepend(base);
-  }
-  base.setAttribute('href', finalUrl);
-
-  // ═══ 3단계: CSS/이미지 인라인 (시간 예산 내에서 최선) ═══
-  const remaining = deadline - Date.now();
-  const inlineBudget = Math.min(remaining - 2000, INLINE_BUDGET); // 직렬화에 2초 여유
-
-  if (inlineBudget >= MIN_INLINE_BUDGET) {
-    // 시간 예산이 있으면 CSS와 이미지를 병렬로 인라인 시도
-    // budget으로 인라인 총 바이트를 추적해 메시지가 WebSocket 전송에 안전한 크기를 유지
-    // raceDeadline: 예산 내에 끝나면 결과 사용, 아니면 무시하고 진행
-    const budget = { used: 0 };
-    const inlineWork = Promise.all([
-      inlineStylesheets(doc, finalUrl, budget),
-      inlineImages(doc, finalUrl, budget),
-    ]);
-    const result = await raceDeadline(inlineWork, inlineBudget, 'timeout');
-    if (result === 'timeout') {
-      lite = true;
-      console.log('[Agent] 인라인 예산 초과, 라이트 모드로 전송:', finalUrl);
+    // <base> 태그 추가 (남은 상대 경로 대비)
+    let base = doc.querySelector('base');
+    if (!base) {
+      base = doc.createElement('base');
+      const head = doc.querySelector('head') || doc.documentElement;
+      head.prepend(base);
     }
-  } else {
-    // 시간이 거의 없으면 인라인 건너뜀
-    lite = true;
-    console.log('[Agent] 인라인 예산 부족, 라이트 모드로 전송:', finalUrl);
+    base.setAttribute('href', finalUrl);
+
+    // ═══ 3단계: CSS/이미지 인라인 (시간 예산 내에서 최선) ═══
+    const remaining = deadline - Date.now();
+    const inlineBudget = Math.min(remaining - 2000, INLINE_BUDGET); // 직렬화에 2초 여유
+
+    if (inlineBudget >= MIN_INLINE_BUDGET) {
+      // budget으로 인라인 총 바이트를 추적해 메시지가 WebSocket 전송에 안전한 크기를 유지
+      // raceDeadline: 예산 내에 끝나면 결과 사용, 아니면 무시하고 진행
+      const budget = { used: 0 };
+      const inlineWork = Promise.all([
+        inlineStylesheets(doc, finalUrl, budget),
+        inlineImages(doc, finalUrl, budget),
+      ]);
+      const result = await raceDeadline(inlineWork, inlineBudget, 'timeout');
+      if (result === 'timeout') {
+        lite = true;
+        console.log('[Agent] 인라인 예산 초과, 라이트 모드로 전송:', finalUrl);
+      }
+    } else {
+      lite = true;
+      console.log('[Agent] 인라인 예산 부족, 라이트 모드로 전송:', finalUrl);
+    }
+
+    // ═══ 4단계: 직렬화 + 결과 반환 (항상 성공) ═══
+    const title = (doc.querySelector('title')?.textContent || new URL(finalUrl).hostname).trim();
+    const output = dom.serialize();
+
+    return {
+      html: output,
+      title,
+      url: finalUrl,
+      elapsed: Date.now() - start,
+      size: Buffer.byteLength(output, 'utf8'),
+      lite, // 클라이언트에게 라이트 모드 여부 전달
+    };
+  } finally {
+    try { dom.window.close(); } catch {}
   }
-
-  // ═══ 4단계: 직렬화 + 결과 반환 (항상 성공) ═══
-  const title = (doc.querySelector('title')?.textContent || new URL(finalUrl).hostname).trim();
-  const output = dom.serialize();
-
-  return {
-    html: output,
-    title,
-    url: finalUrl,
-    elapsed: Date.now() - start,
-    size: Buffer.byteLength(output, 'utf8'),
-    lite, // 클라이언트에게 라이트 모드 여부 전달
-  };
 }
 
 // ── WebSocket 에이전트 핸들러 ──

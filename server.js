@@ -7,6 +7,11 @@ const { epoxyPath } = require('@mercuryworkshop/epoxy-transport');
 const { server: wisp, logging } = require('@mercuryworkshop/wisp-js/server');
 const { handleAgentConnection } = require('./agent');
 
+// 한 요청·한 페이지의 예기치 않은 오류가 프로세스를 죽이면 모든 사용자의 WebSocket이
+// 동시에 끊긴다. 프로세스를 살려 두어 다른 연결을 보호한다. (로깅만, 복구는 각 연결이 재시도)
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', e && e.message));
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e && (e.message || e)));
+
 logging.set_level(logging.WARN);
 wisp.options.allow_private_ips = false;
 wisp.options.allow_loopback_ips = false;
@@ -56,9 +61,10 @@ const server = app.listen(process.env.PORT || 3000, () => {
 // ── WebSocket 업그레이드 라우팅 ──
 // /wisp/  → 기존 Wisp 프록시 (YouTube, 치지직 등 스트리밍 가능)
 // /agent/ → 에이전트 모드 (서버사이드 렌더링, 백업)
-// 큰 페이지가 WebSocket 1프레임으로 들어오므로 payload 상한을 16MB로 올린다 (기본 100MB보다는 낮게).
-// perMessageDeflate는 큰 HTML을 압축해 전송 시간을 줄인다.
-const agentWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024, perMessageDeflate: { threshold: 1024 } });
+// 큰 페이지가 WebSocket 1프레임으로 들어오므로 payload 상한을 16MB로 올린다.
+// perMessageDeflate는 ws 공식 문서가 메모리·성능 문제로 비권장 — Render 512MB에서
+// 불안정을 유발하므로 끈다. 응답 크기는 agent.js의 인라인 예산(5MB)으로 이미 제한된다.
+const agentWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024, perMessageDeflate: false });
 
 agentWss.on('connection', handleAgentConnection);
 
